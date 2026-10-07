@@ -8,7 +8,8 @@ import { RichTextEditor } from './RichTextEditor';
 import { MediaStrip } from '../media/MediaStrip';
 import { MediaUploader } from '../media/MediaUploader';
 import { CATEGORY_LABELS, CATEGORY_ORDER, PERSON_ROLE_LABELS, PRECISION_HINTS, PRECISION_LABELS, VISIBILITY_LABELS } from '../../lib/constants';
-import type { Category, ItemDetail, Media, Person, PersonRole, Precision, Visibility } from '../../api/types';
+import type { Category, ItemDetail, Media, Member, Person, PersonRole, Precision, Visibility } from '../../api/types';
+import { useAuth } from '../auth/AuthContext';
 import { useFamily } from '../families/useFamily';
 
 interface FormState {
@@ -27,6 +28,7 @@ interface FormState {
   condition: string;
   storageLocation: string;
   people: { personId: string; role: PersonRole }[];
+  sharedWith: { userId: string; canEdit: boolean }[];
 }
 
 const EMPTY: FormState = {
@@ -45,6 +47,7 @@ const EMPTY: FormState = {
   condition: '',
   storageLocation: '',
   people: [],
+  sharedWith: [],
 };
 
 function toAcquiredAt(precision: Precision, value: string): string | null {
@@ -82,6 +85,7 @@ function fromItem(item: ItemDetail): FormState {
     condition: item.condition ?? '',
     storageLocation: item.storageLocation ?? '',
     people: item.people.map((p) => ({ personId: p.personId, role: p.role })),
+    sharedWith: item.sharedWith.map((s) => ({ userId: s.userId, canEdit: s.canEdit })),
   };
 }
 
@@ -90,6 +94,7 @@ export function ItemFormPage({ mode }: { mode: 'create' | 'edit' }) {
   const navigate = useNavigate();
   const queryClient = useQueryClient();
   const { push } = useToast();
+  const { user } = useAuth();
   const { data: familyData } = useFamily(fid);
 
   const [form, setForm] = useState<FormState>(EMPTY);
@@ -107,6 +112,12 @@ export function ItemFormPage({ mode }: { mode: 'create' | 'edit' }) {
     enabled: Boolean(fid),
   });
 
+  const members = useQuery({
+    queryKey: ['members', fid],
+    queryFn: () => api.get<{ members: Member[] }>(`/families/${fid}/members`),
+    enabled: Boolean(fid),
+  });
+
   const detail = useQuery({
     queryKey: ['item', fid, itemId],
     queryFn: () => api.get<{ item: ItemDetail }>(`/families/${fid}/items/${itemId}`),
@@ -116,6 +127,20 @@ export function ItemFormPage({ mode }: { mode: 'create' | 'edit' }) {
   useEffect(() => {
     if (mode === 'edit' && detail.data) setForm(fromItem(detail.data.item));
   }, [mode, detail.data]);
+
+  // 授权对象后来被移出家庭时，保存会因「不是该家庭成员」被后端拒绝；
+  // 成员列表加载后把这些失效的授权从表单里剔除（对 ex-member 的授权本就无意义）。
+  useEffect(() => {
+    if (!members.data) return;
+    const valid = new Set(
+      members.data.members.filter((m) => m.status === 'active').map((m) => m.userId),
+    );
+    setForm((prev) =>
+      prev.sharedWith.some((s) => !valid.has(s.userId))
+        ? { ...prev, sharedWith: prev.sharedWith.filter((s) => valid.has(s.userId)) }
+        : prev,
+    );
+  }, [members.data, detail.data]);
 
   // 草稿保护：新建时中途切走/刷新不丢内容
   useEffect(() => {
@@ -192,6 +217,10 @@ export function ItemFormPage({ mode }: { mode: 'create' | 'edit' }) {
   const set = <K extends keyof FormState>(key: K, value: FormState[K]) => setForm((prev) => ({ ...prev, [key]: value }));
   const busy = create.isPending || update.isPending;
   const media: Media[] = detail.data?.item.media ?? [];
+  // 创建者天然有全部权限，不必再授权给自己；被停用的成员也不能作为授权对象
+  const shareableMembers = (members.data?.members ?? []).filter(
+    (m) => m.status === 'active' && m.userId !== user?.id,
+  );
 
   return (
     <div>
@@ -427,6 +456,62 @@ export function ItemFormPage({ mode }: { mode: 'create' | 'edit' }) {
               }))}
             />
           </Field>
+          {form.visibility === 'selected' ? (
+            <Field label="指定成员" hint="只有被勾选的家人（和你自己）能看到这条记录">
+              <div>
+                {shareableMembers.length ? (
+                  shareableMembers.map((m) => {
+                    const selected = form.sharedWith.find((s) => s.userId === m.userId);
+                    return (
+                      <div key={m.userId} className="row" style={{ marginBottom: 6, gap: 'var(--space-2)' }}>
+                        <label className="row" style={{ gap: 6, minWidth: 160, cursor: 'pointer' }}>
+                          <input
+                            type="checkbox"
+                            checked={Boolean(selected)}
+                            onChange={(e) =>
+                              set(
+                                'sharedWith',
+                                e.target.checked
+                                  ? [...form.sharedWith, { userId: m.userId, canEdit: false }]
+                                  : form.sharedWith.filter((s) => s.userId !== m.userId),
+                              )
+                            }
+                          />
+                          <span>{m.user.displayName}</span>
+                        </label>
+                        {selected ? (
+                          <label className="row" style={{ gap: 4, cursor: 'pointer' }}>
+                            <input
+                              type="checkbox"
+                              checked={selected.canEdit}
+                              onChange={(e) =>
+                                set(
+                                  'sharedWith',
+                                  form.sharedWith.map((s) =>
+                                    s.userId === m.userId ? { ...s, canEdit: e.target.checked } : s,
+                                  ),
+                                )
+                              }
+                            />
+                            <span className="muted">可编辑</span>
+                          </label>
+                        ) : null}
+                      </div>
+                    );
+                  })
+                ) : (
+                  <p className="muted" style={{ margin: 0 }}>
+                    家庭里还没有其他成员，可以先保存，之后邀请家人加入再来授权。
+                  </p>
+                )}
+                {shareableMembers.length > 0 && form.sharedWith.length === 0 ? (
+                  <p className="field__hint" style={{ marginTop: 4 }}>
+                    还没有勾选成员，目前这条记录只有你自己能看到。
+                  </p>
+                ) : null}
+              </div>
+            </Field>
+          ) : null}
         </section>
 
         {mode === 'edit' && itemId ? (
@@ -499,5 +584,7 @@ function buildPayload(form: FormState) {
       .slice(0, 20),
     visibility: form.visibility,
     people: form.people,
+    // 只有「指定成员」才保留授权名单；切到其他可见范围时显式清空，避免旧授权继续生效
+    sharedWith: form.visibility === 'selected' ? form.sharedWith : [],
   };
 }

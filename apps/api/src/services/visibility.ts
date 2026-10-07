@@ -7,7 +7,12 @@ import type { FamilyRole, Prisma } from '@prisma/client';
  */
 export function itemVisibilityWhere(userId: string, role: FamilyRole): Prisma.ItemWhereInput {
   const privileged = role === 'owner' || role === 'admin';
-  const clauses: Prisma.ItemWhereInput[] = [{ createdBy: userId }, { shares: { some: { userId } } }];
+  // 与 itemAccess 的判定保持一致：被授权的成员也只能看到已发布/已归档的条目，
+  // 草稿与回收站对授权对象不可见（详情接口同样返回 404）。
+  const clauses: Prisma.ItemWhereInput[] = [
+    { createdBy: userId },
+    { shares: { some: { userId } }, status: { in: ['published', 'archived'] } },
+  ];
   if (privileged) {
     clauses.push({});
   } else {
