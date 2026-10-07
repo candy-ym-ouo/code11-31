@@ -268,11 +268,11 @@ export function ItemDetailPage() {
             </section>
           ) : null}
 
-          {item.sharedWith.length > 0 ? (
+          {item.visibility === 'selected' && item.sharedWith.length > 0 ? (
             <section className="card">
-              <h2 style={{ marginBottom: 'var(--space-3)' }}>额外授权</h2>
+              <h2 style={{ marginBottom: 'var(--space-3)' }}>指定可见的家人</h2>
               <p className="muted" style={{ fontSize: 13 }}>
-                除家庭成员外，这些家人也被单独授权查看：
+                除创建者与管理员外，只有这些家人能看到这条记录：
               </p>
               <div className="row">
                 {item.sharedWith.map((s) => (

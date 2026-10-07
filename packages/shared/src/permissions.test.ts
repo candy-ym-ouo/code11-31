@@ -87,6 +87,40 @@ describe('itemAccess 可见性与可写性', () => {
     expect(editable.canEdit).toBe(true);
   });
 
+  it('授权只在 selected 可见范围下有效：切到 private/family 后残留的旧授权不再放行', () => {
+    const stalePrivate = itemAccess({
+      ...base,
+      userId: 'u2',
+      role: 'contributor',
+      visibility: 'private',
+      sharedWithMe: { canEdit: true },
+    });
+    expect(stalePrivate.canRead).toBe(false);
+
+    // family 本来就全家可读，但旧的 canEdit 授权不应继续授予编辑权
+    const staleFamily = itemAccess({
+      ...base,
+      userId: 'u2',
+      role: 'viewer',
+      visibility: 'family',
+      sharedWithMe: { canEdit: true },
+    });
+    expect(staleFamily.canRead).toBe(true);
+    expect(staleFamily.canEdit).toBe(false);
+  });
+
+  it('selected 草稿：被授权成员在发布前依然看不到（草稿只属于创建者与管理员）', () => {
+    const grantee = itemAccess({
+      ...base,
+      userId: 'u2',
+      role: 'contributor',
+      visibility: 'selected',
+      status: 'draft',
+      sharedWithMe: { canEdit: true },
+    });
+    expect(grantee.canRead).toBe(false);
+  });
+
   it('editor 能改自己创建的条目，但不能改别人创建的家庭公开条目', () => {
     expect(itemAccess({ ...base, role: 'editor', visibility: 'family' }).canEdit).toBe(true);
     expect(itemAccess({ ...base, userId: 'u2', role: 'editor', visibility: 'family' }).canEdit).toBe(false);

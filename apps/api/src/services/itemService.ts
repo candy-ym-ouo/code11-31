@@ -184,6 +184,26 @@ async function assertUsersBelongToFamily(familyId: string, userIds: string[]): P
   if (found !== new Set(userIds).size) throw badRequest('存在不属于该家庭的成员');
 }
 
+/**
+ * 归一化「指定成员」授权：
+ * - 仅在可见范围为 selected 时保留，其余范围一律清空（授权与可见范围一并保存）；
+ * - 创建者天然可见，无需给自己授权；
+ * - 同一成员重复出现时以「可编辑」为准。
+ */
+export function normalizeShares(
+  visibility: Visibility,
+  raw: { userId: string; canEdit: boolean }[] | undefined,
+  creatorId: string,
+): { userId: string; canEdit: boolean }[] {
+  if (visibility !== 'selected' || !raw) return [];
+  const byUser = new Map<string, boolean>();
+  for (const s of raw) {
+    if (s.userId === creatorId) continue;
+    byUser.set(s.userId, (byUser.get(s.userId) ?? false) || s.canEdit);
+  }
+  return [...byUser].map(([userId, canEdit]) => ({ userId, canEdit }));
+}
+
 export async function createItem(userId: string, ctx: FamilyContext, input: ItemInput, meta: ActorMeta) {
   if (!input.title || !input.category) throw badRequest('标题与分类为必填项');
   const story = cleanStory(input.storyHtml);
@@ -192,9 +212,11 @@ export async function createItem(userId: string, ctx: FamilyContext, input: Item
   const sortValue = computeSortAt({ acquiredAt, acquiredPrecision: precision }, new Date());
 
   await assertPeopleBelongToFamily(ctx.familyId, (input.people ?? []).map((p) => p.personId));
-  await assertUsersBelongToFamily(ctx.familyId, (input.sharedWith ?? []).map((s) => s.userId));
 
   const family = await prisma.family.findUniqueOrThrow({ where: { id: ctx.familyId } });
+  const visibility = input.visibility ?? family.defaultVisibility;
+  const shares = normalizeShares(visibility, input.sharedWith, userId);
+  await assertUsersBelongToFamily(ctx.familyId, shares.map((s) => s.userId));
 
   return prisma.$transaction(async (tx) => {
     const created = await tx.item.create({
@@ -203,7 +225,7 @@ export async function createItem(userId: string, ctx: FamilyContext, input: Item
         title: input.title!,
         category: input.category!,
         status: 'draft',
-        visibility: input.visibility ?? family.defaultVisibility,
+        visibility,
         acquiredAt,
         acquiredPrecision: precision,
         acquiredLabel: input.acquiredLabel ?? null,
@@ -224,9 +246,7 @@ export async function createItem(userId: string, ctx: FamilyContext, input: Item
         people: input.people?.length
           ? { create: input.people.map((p) => ({ personId: p.personId, role: p.role as never })) }
           : undefined,
-        shares: input.sharedWith?.length
-          ? { create: input.sharedWith.map((s) => ({ userId: s.userId, canEdit: s.canEdit })) }
-          : undefined,
+        shares: shares.length ? { create: shares } : undefined,
       },
       include: LIST_INCLUDE,
     });
@@ -286,7 +306,12 @@ export async function updateItem(
   if (item.status === 'trashed') throw conflict('回收站中的条目不可编辑，请先恢复');
 
   await assertPeopleBelongToFamily(ctx.familyId, (input.people ?? []).map((p) => p.personId));
-  await assertUsersBelongToFamily(ctx.familyId, (input.sharedWith ?? []).map((s) => s.userId));
+
+  const nextVisibility = input.visibility ?? item.visibility;
+  // 可见范围与成员授权一并保存：只要这次带了 sharedWith（可能为空数组，表示清空），
+  // 就按当前可见范围归一化后整组替换；切到非 selected 时旧授权立即失效。
+  const shares = input.sharedWith ? normalizeShares(nextVisibility, input.sharedWith, item.createdBy) : null;
+  if (shares) await assertUsersBelongToFamily(ctx.familyId, shares.map((s) => s.userId));
 
   const story = input.storyHtml === undefined ? { html: null as string | null, text: '' } : cleanStory(input.storyHtml);
   const nextAcquiredAt =
@@ -331,11 +356,11 @@ export async function updateItem(
         });
       }
     }
-    if (input.sharedWith) {
+    if (shares) {
       await tx.itemShare.deleteMany({ where: { itemId } });
-      if (input.sharedWith.length) {
+      if (shares.length) {
         await tx.itemShare.createMany({
-          data: input.sharedWith.map((s) => ({ itemId, userId: s.userId, canEdit: s.canEdit })),
+          data: shares.map((s) => ({ itemId, userId: s.userId, canEdit: s.canEdit })),
         });
       }
     }

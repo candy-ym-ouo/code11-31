@@ -113,8 +113,12 @@ export function itemAccess(input: ItemAccessInput): ItemAccess {
     canRead = true;
   } else if (visibility === 'family' || visibility === 'link') {
     canRead = true;
-  } else {
+  } else if (visibility === 'selected') {
+    // 单独授权只在「指定成员」可见范围下有效；
+    // 切换可见范围后即便数据库里残留旧授权也不能再放行。
     canRead = shared;
+  } else {
+    canRead = false;
   }
 
   if (!canRead) {

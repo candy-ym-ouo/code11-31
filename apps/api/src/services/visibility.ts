@@ -7,7 +7,16 @@ import type { FamilyRole, Prisma } from '@prisma/client';
  */
 export function itemVisibilityWhere(userId: string, role: FamilyRole): Prisma.ItemWhereInput {
   const privileged = role === 'owner' || role === 'admin';
-  const clauses: Prisma.ItemWhereInput[] = [{ createdBy: userId }, { shares: { some: { userId } } }];
+  const clauses: Prisma.ItemWhereInput[] = [
+    { createdBy: userId },
+    // 授权（ItemShare）只在「指定成员」可见范围、且条目已发布/归档时才生效；
+    // 切到其他可见范围后残留的旧授权不得再放行，草稿也只属于创建者与管理员。
+    {
+      visibility: 'selected',
+      status: { in: ['published', 'archived'] },
+      shares: { some: { userId } },
+    },
+  ];
   if (privileged) {
     clauses.push({});
   } else {

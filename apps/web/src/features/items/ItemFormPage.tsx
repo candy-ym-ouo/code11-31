@@ -8,7 +8,8 @@ import { RichTextEditor } from './RichTextEditor';
 import { MediaStrip } from '../media/MediaStrip';
 import { MediaUploader } from '../media/MediaUploader';
 import { CATEGORY_LABELS, CATEGORY_ORDER, PERSON_ROLE_LABELS, PRECISION_HINTS, PRECISION_LABELS, VISIBILITY_LABELS } from '../../lib/constants';
-import type { Category, ItemDetail, Media, Person, PersonRole, Precision, Visibility } from '../../api/types';
+import type { Category, ItemDetail, Media, Member, Person, PersonRole, Precision, Visibility } from '../../api/types';
+import { useAuth } from '../auth/AuthContext';
 import { useFamily } from '../families/useFamily';
 
 interface FormState {
@@ -27,6 +28,8 @@ interface FormState {
   condition: string;
   storageLocation: string;
   people: { personId: string; role: PersonRole }[];
+  // 可见范围为 selected 时的单独授权：userId + 是否可编辑
+  sharedWith: { userId: string; canEdit: boolean }[];
 }
 
 const EMPTY: FormState = {
@@ -45,6 +48,7 @@ const EMPTY: FormState = {
   condition: '',
   storageLocation: '',
   people: [],
+  sharedWith: [],
 };
 
 function toAcquiredAt(precision: Precision, value: string): string | null {
@@ -82,6 +86,7 @@ function fromItem(item: ItemDetail): FormState {
     condition: item.condition ?? '',
     storageLocation: item.storageLocation ?? '',
     people: item.people.map((p) => ({ personId: p.personId, role: p.role })),
+    sharedWith: item.sharedWith.map((s) => ({ userId: s.userId, canEdit: s.canEdit })),
   };
 }
 
@@ -90,6 +95,7 @@ export function ItemFormPage({ mode }: { mode: 'create' | 'edit' }) {
   const navigate = useNavigate();
   const queryClient = useQueryClient();
   const { push } = useToast();
+  const { user } = useAuth();
   const { data: familyData } = useFamily(fid);
 
   const [form, setForm] = useState<FormState>(EMPTY);
@@ -104,6 +110,12 @@ export function ItemFormPage({ mode }: { mode: 'create' | 'edit' }) {
   const people = useQuery({
     queryKey: ['people', fid],
     queryFn: () => api.get<{ people: Person[] }>(`/families/${fid}/people`),
+    enabled: Boolean(fid),
+  });
+
+  const members = useQuery({
+    queryKey: ['members', fid],
+    queryFn: () => api.get<{ members: Member[] }>(`/families/${fid}/members`),
     enabled: Boolean(fid),
   });
 
@@ -123,7 +135,9 @@ export function ItemFormPage({ mode }: { mode: 'create' | 'edit' }) {
     const saved = localStorage.getItem(draftKey);
     if (saved) {
       try {
-        setForm(JSON.parse(saved) as FormState);
+        // 旧版本草稿没有 people/sharedWith 字段，补齐避免后续渲染崩溃
+        const parsed = JSON.parse(saved) as Partial<FormState>;
+        setForm({ ...EMPTY, ...parsed, people: parsed.people ?? [], sharedWith: parsed.sharedWith ?? [] });
         push('已恢复上次没写完的草稿', 'info');
       } catch {
         localStorage.removeItem(draftKey);
@@ -193,6 +207,27 @@ export function ItemFormPage({ mode }: { mode: 'create' | 'edit' }) {
   const busy = create.isPending || update.isPending;
   const media: Media[] = detail.data?.item.media ?? [];
 
+  // 「指定成员」必须至少勾选一位家人，否则存出来的条目会变成只有创建者可见
+  const noGrantee =
+    form.visibility === 'selected' &&
+    form.sharedWith.length === 0 &&
+    !members.isLoading &&
+    (members.data?.members ?? []).some((m) => m.status === 'active' && m.userId !== user?.id);
+
+  const save = () => {
+    setError(null);
+    if (!form.title.trim()) {
+      setError('请先给这件物品起个名字');
+      return;
+    }
+    if (noGrantee) {
+      setError('可见范围是「指定家人能看」，请至少勾选一位家人；如果只想自己看，请选「只有我能看」');
+      return;
+    }
+    if (mode === 'create') create.mutate();
+    else update.mutate();
+  };
+
   return (
     <div>
       <div className="page-head">
@@ -204,15 +239,7 @@ export function ItemFormPage({ mode }: { mode: 'create' | 'edit' }) {
         </div>
         <div className="page-head__actions">
           <Button onClick={() => navigate(-1)}>取消</Button>
-          <Button variant="primary" loading={busy} onClick={() => {
-            setError(null);
-            if (!form.title.trim()) {
-              setError('请先给这件物品起个名字');
-              return;
-            }
-            if (mode === 'create') create.mutate();
-            else update.mutate();
-          }}>
+          <Button variant="primary" loading={busy} onClick={save}>
             保存
           </Button>
         </div>
@@ -427,6 +454,71 @@ export function ItemFormPage({ mode }: { mode: 'create' | 'edit' }) {
               }))}
             />
           </Field>
+
+          {form.visibility === 'selected' ? (
+            <div style={{ marginTop: 'var(--space-2)' }}>
+              <Field label="指定哪些家人" hint="勾选的家人在条目发布后可以查看；勾选「可编辑」还允许他们修改这条记录。创建者自己始终可见，无需选择。">
+                {(() => {
+                  const candidates = (members.data?.members ?? []).filter(
+                    (m) => m.status === 'active' && m.userId !== user?.id,
+                  );
+                  if (members.isLoading) return <Spinner label="正在读取家庭成员…" />;
+                  if (candidates.length === 0) {
+                    return <p className="field__error">家里还没有其他成员，保存后将只有你自己能看到。</p>;
+                  }
+                  return (
+                    <div className="stack" style={{ gap: 6 }}>
+                      {candidates.map((m) => {
+                        const granted = form.sharedWith.find((s) => s.userId === m.userId);
+                        return (
+                          <div key={m.userId} className="row" style={{ gap: 'var(--space-2)' }}>
+                            <label className="row" style={{ gap: 6, minWidth: 200, cursor: 'pointer' }}>
+                              <input
+                                type="checkbox"
+                                checked={Boolean(granted)}
+                                onChange={(e) =>
+                                  set(
+                                    'sharedWith',
+                                    e.target.checked
+                                      ? [...form.sharedWith, { userId: m.userId, canEdit: false }]
+                                      : form.sharedWith.filter((s) => s.userId !== m.userId),
+                                  )
+                                }
+                              />
+                              <span>
+                                {m.user.displayName}
+                                <span className="muted">（{m.user.email}）</span>
+                              </span>
+                            </label>
+                            {granted ? (
+                              <label className="row" style={{ gap: 4, cursor: 'pointer', fontSize: 13 }}>
+                                <input
+                                  type="checkbox"
+                                  checked={granted.canEdit}
+                                  onChange={(e) =>
+                                    set(
+                                      'sharedWith',
+                                      form.sharedWith.map((s) =>
+                                        s.userId === m.userId ? { ...s, canEdit: e.target.checked } : s,
+                                      ),
+                                    )
+                                  }
+                                />
+                                可编辑
+                              </label>
+                            ) : null}
+                          </div>
+                        );
+                      })}
+                      {form.sharedWith.length === 0 ? (
+                        <p className="field__hint">还没有勾选任何家人。</p>
+                      ) : null}
+                    </div>
+                  );
+                })()}
+              </Field>
+            </div>
+          ) : null}
         </section>
 
         {mode === 'edit' && itemId ? (
@@ -460,15 +552,7 @@ export function ItemFormPage({ mode }: { mode: 'create' | 'edit' }) {
           <Button
             variant="primary"
             loading={busy}
-            onClick={() => {
-              setError(null);
-              if (!form.title.trim()) {
-                setError('请先给这件物品起个名字');
-                return;
-              }
-              if (mode === 'create') create.mutate();
-              else update.mutate();
-            }}
+            onClick={save}
           >
             保存
           </Button>
@@ -499,5 +583,10 @@ function buildPayload(form: FormState) {
       .slice(0, 20),
     visibility: form.visibility,
     people: form.people,
+    // 成员授权与可见范围一并提交：非 selected 时发送空数组，让后端清掉可能残留的旧授权
+    sharedWith:
+      form.visibility === 'selected'
+        ? form.sharedWith.map((s) => ({ userId: s.userId, canEdit: s.canEdit }))
+        : [],
   };
 }

@@ -199,29 +199,46 @@ if [ "$VER_COUNT" -ge 2 ]; then ok "版本历史已记录（$VER_COUNT 个版本
 
 # ---------- 7. 邀请家人 + 权限边界 ----------
 step "7/10 邀请家人与权限边界"
-code=$(req POST "$V1/families/$FID/invites" "$JAR_A" '{"role":"viewer","expiresInDays":7,"maxUses":1,"note":"给小妹"}' "$TOKEN_A")
+code=$(req POST "$V1/families/$FID/invites" "$JAR_A" '{"role":"viewer","expiresInDays":7,"maxUses":2,"note":"给小妹"}' "$TOKEN_A")
 expect "$code" 201 "生成只读成员的邀请码"
 INVITE_CODE=$(json 'd.invite.code' < "$WORK/body")
 
 code=$(curl -sS -o "$WORK/body" -w '%{http_code}' "$V1/invites/$INVITE_CODE"); expect "$code" 200 "未登录也能预览邀请信息"
 
 EMAIL_B="viewer-$RUN_ID@example.com"
+# 未开放公开注册时，新用户注册会被拒；这种部署下改用 OWNER 账号无法模拟第二个成员，
+# selected 场景需要真实第二用户，相关断言标记跳过。
+SKIP_SELECTED=0
 code=$(req POST "$V1/auth/register" "$JAR_B" "{\"email\":\"$EMAIL_B\",\"password\":\"family2026\",\"displayName\":\"小妹\"}")
-if [ "$code" = "409" ]; then ok "未开放注册时拒绝陌生人自助注册"; else bad "第二个用户不应能自由注册（实际 $code）"; fi
+if [ "$code" = "201" ]; then
+  ok "第二个用户注册成功"
+  TOKEN_B=$(json 'd.accessToken' < "$WORK/body")
+elif [ "$code" = "409" ]; then
+  ok "未开放注册时拒绝陌生人自助注册"
+  SKIP_SELECTED=1
+else
+  bad "第二个用户注册返回异常状态码：$code"
+  SKIP_SELECTED=1
+fi
 
-code=$(req POST "$V1/auth/login" "$JAR_B" "{\"email\":\"$EMAIL_A\",\"password\":\"wrong-password\"}")
+# 错误密码必须被拒（用第一用户的账号）
+code=$(req POST "$V1/auth/login" "$JAR_A" "{\"email\":\"$EMAIL_A\",\"password\":\"wrong-password\"}")
 expect "$code" 401 "错误密码被拒绝"
 
-# 用已有账号接受邀请（同一个 jar，模拟新用户注册后加入）
-code=$(req POST "$V1/auth/logout" "$JAR_B" "" ""); # 清理
-code=$(req POST "$V1/invites/$INVITE_CODE/accept" "$JAR_A" "" "$TOKEN_A")
-expect "$code" 200 "接受邀请加入家庭"
+if [ "$SKIP_SELECTED" -eq 0 ]; then
+  code=$(req POST "$V1/invites/$INVITE_CODE/accept" "$JAR_B" "" "$TOKEN_B")
+  expect "$code" 200 "第二用户接受邀请加入家庭"
+  ROLE_B=$(json 'd.role' < "$WORK/body")
+  if [ "$ROLE_B" = "viewer" ]; then ok "第二用户角色为 viewer"; else bad "第二用户角色应为 viewer，实际 $ROLE_B"; fi
+else
+  # 跑不了双用户时，至少验证邀请接受接口本身可用（owner 已是成员 → alreadyMember）
+  code=$(req POST "$V1/invites/$INVITE_CODE/accept" "$JAR_A" "" "$TOKEN_A")
+  expect "$code" 200 "接受邀请（已是成员，幂等返回）"
+fi
 
 code=$(req GET "$V1/families/$FID/members" "$JAR_A" "" "$TOKEN_A"); expect "$code" 200 "读取成员列表"
 
-# 把 owner 自己降级成 viewer 试试（不应该影响后续断言，先跳过）
-# 用第二浏览器注册：先临时开放注册需要改配置，这里改为直接验证 viewer 语义：
-# 把当前用户角色改为 viewer 后，验证写操作被拒 → 再改回 owner
+# 不能修改家庭创建者的角色
 code=$(req PATCH "$V1/families/$FID/members/$(json 'd.members.find(m=>m.role==="owner").userId' < "$WORK/body")" "$JAR_A" '{"op":"role","role":"viewer"}' "$TOKEN_A")
 expect "$code" 403 "不能修改家庭创建者的角色"
 
@@ -229,6 +246,63 @@ expect "$code" 403 "不能修改家庭创建者的角色"
 code=$(req POST "$V1/families/$FID/items" "$JAR_A" '{"title":"只有我知道的私密物件","category":"other","acquiredPrecision":"unknown","visibility":"private"}' "$TOKEN_A")
 PRIVATE_ID=$(json 'd.item.id' < "$WORK/body")
 if [ -n "$PRIVATE_ID" ]; then ok "创建 private 条目"; else bad "private 条目创建失败"; fi
+
+# 指定成员（selected）：选择成员与授权一并保存并生效
+if [ "$SKIP_SELECTED" -eq 0 ]; then
+  code=$(req GET "$V1/auth/me" "$JAR_B" "" "$TOKEN_B")
+  USER_B=$(json 'd.user.id' < "$WORK/body")
+
+  # 先建一条 selected 草稿：发布前第二用户在列表与详情里都看不到
+  code=$(req POST "$V1/families/$FID/items" "$JAR_A" "{\"title\":\"给小妹一个人看的手稿\",\"category\":\"manuscript\",\"acquiredPrecision\":\"unknown\",\"visibility\":\"selected\",\"sharedWith\":[{\"userId\":\"$USER_B\",\"canEdit\":false}]}" "$TOKEN_A")
+  expect "$code" 201 "创建 selected 条目并同时授权第二用户"
+  SEL_ID=$(json 'd.item.id' < "$WORK/body")
+  code=$(req GET "$V1/families/$FID/items/$SEL_ID" "$JAR_A" "" "$TOKEN_A")
+  SEL_SHARES=$(json 'd.item.sharedWith.length' < "$WORK/body")
+  if [ "$SEL_SHARES" = "1" ]; then ok "授权成员随条目一并保存（sharedWith=1）"; else bad "授权未随条目保存（sharedWith=$SEL_SHARES）"; fi
+
+  code=$(req GET "$V1/families/$FID/items/$SEL_ID" "$JAR_B" "" "$TOKEN_B")
+  expect "$code" 404 "草稿发布前，被授权成员也看不到"
+  code=$(req GET "$V1/families/$FID/items?visibility=selected" "$JAR_B" "" "$TOKEN_B")
+  SEL_IN_LIST=$(json 'd.items.filter(i=>i.id==="'"$SEL_ID"'").length' < "$WORK/body")
+  if [ "$SEL_IN_LIST" = "0" ]; then ok "草稿不会泄进被授权成员的列表"; else bad "草稿泄进了列表（$SEL_IN_LIST）"; fi
+
+  code=$(req POST "$V1/families/$FID/items/$SEL_ID/publish" "$JAR_A" "" "$TOKEN_A")
+  expect "$code" 200 "selected 条目发布"
+
+  code=$(req GET "$V1/families/$FID/items/$SEL_ID" "$JAR_B" "" "$TOKEN_B")
+  expect "$code" 200 "发布后，被授权成员可以查看"
+  code=$(req GET "$V1/families/$FID/items?visibility=selected" "$JAR_B" "" "$TOKEN_B")
+  SEL_IN_LIST=$(json 'd.items.filter(i=>i.id==="'"$SEL_ID"'").length' < "$WORK/body")
+  if [ "$SEL_IN_LIST" = "1" ]; then ok "被授权成员的列表能看到该条目"; else bad "被授权成员列表缺该条目（$SEL_IN_LIST）"; fi
+
+  # 只读授权：viewer 不可编辑
+  code=$(req PATCH "$V1/families/$FID/items/$SEL_ID" "$JAR_B" '{"title":"被小妹改掉了"}' "$TOKEN_B")
+  expect "$code" 403 "只读授权不能编辑"
+
+  # 把可见范围切回全家可见，旧授权必须立即失效（用 owner 另建对照条目，改回 private 验证 404）
+  code=$(req PATCH "$V1/families/$FID/items/$SEL_ID" "$JAR_A" '{"visibility":"private","sharedWith":[]}' "$TOKEN_A")
+  expect "$code" 200 "切回「只有我能看」并清空授权"
+  code=$(req GET "$V1/families/$FID/items/$SEL_ID" "$JAR_B" "" "$TOKEN_B")
+  expect "$code" 404 "切换可见范围后，旧授权立即失效"
+
+  # 再次切到 selected：这次给可编辑权限（viewer 角色本身无写权限，只能读到；可编辑语义用 contributor 才完整，
+  # 这里至少验证授权成员仍可读且后端正确回存 canEdit）
+  code=$(req PATCH "$V1/families/$FID/items/$SEL_ID" "$JAR_A" "{\"visibility\":\"selected\",\"sharedWith\":[{\"userId\":\"$USER_B\",\"canEdit\":true}]}" "$TOKEN_A")
+  expect "$code" 200 "重新指定成员（可编辑授权）"
+  code=$(req GET "$V1/families/$FID/items/$SEL_ID" "$JAR_A" "" "$TOKEN_A")
+  CAN_EDIT=$(json 'd.item.sharedWith.find(s=>s.userId==="'"$USER_B"'")?.canEdit' < "$WORK/body")
+  if [ "$CAN_EDIT" = "true" ]; then ok "可编辑标记正确保存"; else bad "可编辑标记未保存（$CAN_EDIT）"; fi
+  code=$(req GET "$V1/families/$FID/items/$SEL_ID" "$JAR_B" "" "$TOKEN_B")
+  expect "$code" 200 "重新授权后成员恢复可见"
+
+  # 未被授权的 private 对照条目：发布后第二用户仍然 404
+  code=$(req POST "$V1/families/$FID/items/$PRIVATE_ID/publish" "$JAR_A" "" "$TOKEN_A")
+  expect "$code" 200 "private 对照条目发布（不影响隔离性）"
+  code=$(req GET "$V1/families/$FID/items/$PRIVATE_ID" "$JAR_B" "" "$TOKEN_B")
+  expect "$code" 404 "未授权的 private 条目不可见"
+else
+  echo "  · PUBLIC_SIGNUP=false 且没有第二用户，跳过 selected 双用户断言（请在开放注册或全新实例下验证）"
+fi
 
 # ---------- 8. 检索与时间轴 ----------
 step "8/10 检索与时间轴"
